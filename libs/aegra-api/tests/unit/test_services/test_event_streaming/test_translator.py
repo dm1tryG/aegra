@@ -69,7 +69,7 @@ class TestMessageTranslation:
     def test_channel_is_messages(self) -> None:
         t = EventTranslator()
         events = t.translate("messages", (_chunk("x"), {}))
-        assert all(channel == "messages" for channel, _ in events)
+        assert all(triple[0] == "messages" for triple in events)
 
     def test_message_without_id_is_skipped(self) -> None:
         t = EventTranslator()
@@ -83,19 +83,26 @@ class TestMessageTranslation:
 class TestOtherChannels:
     def test_values_carries_state_dict_directly(self) -> None:
         t = EventTranslator()
-        assert t.translate("values", {"count": 1}) == [("values", {"count": 1})]
+        assert t.translate("values", {"count": 1}) == [("values", {"count": 1}, [])]
 
     def test_updates_one_event_per_node(self) -> None:
         t = EventTranslator()
         events = t.translate("updates", {"node_a": {"x": 1}, "node_b": {"y": 2}})
-        assert ("updates", {"node": "node_a", "values": {"x": 1}}) in events
-        assert ("updates", {"node": "node_b", "values": {"y": 2}}) in events
+        assert ("updates", {"node": "node_a", "values": {"x": 1}}, []) in events
+        assert ("updates", {"node": "node_b", "values": {"y": 2}}, []) in events
 
     def test_custom(self) -> None:
         t = EventTranslator()
-        assert t.translate("custom", {"foo": "bar"}) == [("custom", {"payload": {"foo": "bar"}})]
+        assert t.translate("custom", {"foo": "bar"}) == [("custom", {"payload": {"foo": "bar"}}, [])]
 
     def test_unhandled_modes_return_nothing(self) -> None:
         t = EventTranslator()
         for mode in ("metadata", "debug", "end", "error"):
             assert t.translate(mode, {"anything": True}) == []
+
+
+class TestChannelTripleShape:
+    def test_message_events_carry_empty_namespace(self) -> None:
+        t = EventTranslator()
+        events = t.translate("messages", (_chunk("x"), {}))
+        assert all(len(triple) == 3 and triple[2] == [] for triple in events)

@@ -3125,7 +3125,7 @@
           "Event Streaming"
         ],
         "summary": "Stream Thread Events",
-        "description": "Open a channel-filtered SSE stream of v2 events for a run on the thread.\n\nEach SSE frame is a protocol event envelope: ``event:`` is the channel,\n``data:`` the JSON envelope, ``id:`` the session ``seq`` a client echoes\nback as ``since`` on resume.",
+        "description": "Open a channel-filtered SSE stream of the thread's run events.\n\nThread-scoped: events for any run on the thread flow through, so a\nclient can open the stream then issue ``run.start``. Each SSE frame's\n``data:`` is a protocol event envelope; ``id:`` is the ``seq`` a client\nechoes back as ``since`` on resume.",
         "operationId": "stream_thread_events_threads__thread_id__stream_events_post",
         "parameters": [
           {
@@ -4343,11 +4343,6 @@
       },
       "EventStreamRequest": {
         "properties": {
-          "run_id": {
-            "type": "string",
-            "title": "Run Id",
-            "description": "Run on the thread whose events to stream."
-          },
           "channels": {
             "items": {
               "type": "string"
@@ -4355,6 +4350,37 @@
             "type": "array",
             "title": "Channels",
             "description": "Channels to subscribe to (e.g. messages, values, lifecycle)."
+          },
+          "namespaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Namespaces",
+            "description": "Subgraph namespace prefixes to include."
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depth",
+            "description": "Max subgraph nesting depth to include."
           },
           "since": {
             "anyOf": [
@@ -4372,11 +4398,10 @@
         },
         "type": "object",
         "required": [
-          "run_id",
           "channels"
         ],
         "title": "EventStreamRequest",
-        "description": "Body for ``POST /threads/{thread_id}/stream/events``."
+        "description": "Body for ``POST /threads/{thread_id}/stream/events``.\n\nThread-scoped, matching the LangGraph SDK: no run id \u2014 the stream\ncarries events for whatever run(s) execute on the thread."
       },
       "HTTPValidationError": {
         "properties": {

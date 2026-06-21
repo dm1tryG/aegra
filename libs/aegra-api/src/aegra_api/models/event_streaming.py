@@ -8,10 +8,15 @@ from pydantic import BaseModel, Field
 
 
 class EventStreamRequest(BaseModel):
-    """Body for ``POST /threads/{thread_id}/stream/events``."""
+    """Body for ``POST /threads/{thread_id}/stream/events``.
 
-    run_id: str = Field(..., description="Run on the thread whose events to stream.")
+    Thread-scoped, matching the LangGraph SDK: no run id — the stream
+    carries events for whatever run(s) execute on the thread.
+    """
+
     channels: list[str] = Field(..., description="Channels to subscribe to (e.g. messages, values, lifecycle).")
+    namespaces: list[list[str]] | None = Field(None, description="Subgraph namespace prefixes to include.")
+    depth: int | None = Field(None, ge=0, description="Max subgraph nesting depth to include.")
     since: int | None = Field(
         None,
         ge=0,

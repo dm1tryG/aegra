@@ -18,28 +18,39 @@ from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_streaming import capabilities as caps
 from aegra_api.services.event_streaming import commands as cmd_module
 
+_USER = "test-user"
 
-class _OwnershipSession:
-    """Session whose scalar() answers the thread + run ownership lookups.
 
-    Both ownership checks select an id column; we return a truthy id when
-    owned, ``None`` otherwise. ``owned`` covers both since the tests only
-    need the all-owned or none-owned cases.
+class _Session:
+    """Test session: scalar() returns the thread's owner id, scalars() lists runs.
+
+    ``owner`` is the existing thread's user_id, or None when the thread does
+    not exist yet (the run.start-creates-it path the SDK relies on).
     """
 
-    def __init__(self, *, owned: bool) -> None:
-        self._owned = owned
+    def __init__(self, *, owner: str | None, run_ids: list[str] | None = None) -> None:
+        self._owner = owner
+        self._run_ids = run_ids or []
 
     async def scalar(self, _stmt: Any) -> Any:
-        return "owned-id" if self._owned else None
+        return self._owner
+
+    async def scalars(self, _stmt: Any) -> Any:
+        run_ids = self._run_ids
+
+        class _Result:
+            def all(self) -> list[str]:
+                return run_ids
+
+        return _Result()
 
 
-def _make_app(*, owned: bool = True) -> FastAPI:
+def _make_app(*, owner: str | None = _USER, run_ids: list[str] | None = None) -> FastAPI:
     app = FastAPI()
-    user = User(identity="test-user")
+    user = User(identity=_USER)
     app.dependency_overrides[require_auth] = lambda: user
     app.dependency_overrides[get_current_user] = lambda: user
-    app.dependency_overrides[get_session] = lambda: _OwnershipSession(owned=owned)
+    app.dependency_overrides[get_session] = lambda: _Session(owner=owner, run_ids=run_ids)
     app.include_router(es_module.router)
     return app
 
@@ -75,59 +86,50 @@ class TestCommandRoute:
         assert resp.json()["error"] == "not_supported"
 
     def test_cross_tenant_thread_is_404(self) -> None:
-        client = TestClient(_make_app(owned=False))
+        client = TestClient(_make_app(owner="other-user"))
         resp = client.post("/threads/t1/commands", json={"id": 1, "method": "run.start", "params": {}})
         assert resp.status_code == 404
+
+    def test_new_thread_is_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """run.start against a not-yet-created thread is allowed (the SDK path)."""
+
+        async def fake_prepare(*_args: Any, **_kwargs: Any) -> tuple[str, object, object]:
+            return "run-1", object(), object()
+
+        monkeypatch.setattr(cmd_module, "_prepare_run", fake_prepare)
+        client = TestClient(_make_app(owner=None))  # thread does not exist yet
+        resp = client.post(
+            "/threads/new-thread/commands",
+            json={"id": 1, "method": "run.start", "params": {"assistant_id": "agent", "input": {"messages": []}}},
+        )
+        assert resp.status_code == 200
 
     def test_disabled_flag_returns_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(caps.settings.event_streaming, "FF_V2_EVENT_STREAMING", False)
         client = TestClient(_make_app())
         resp = client.post("/threads/t1/commands", json={"id": 1, "method": "run.start", "params": {}})
         assert resp.status_code == 503
-        # Bare router app returns FastAPI's default {"detail": ...}; the real
-        # app remaps this to {"message": ...} via its exception handler.
         assert "FF_V2_EVENT_STREAMING" in resp.json()["detail"]
 
 
 class TestStreamRoute:
     def test_missing_channels_is_422(self) -> None:
         client = TestClient(_make_app())
-        resp = client.post("/threads/t1/stream/events", json={"run_id": "run-1"})
+        resp = client.post("/threads/t1/stream/events", json={})
         assert resp.status_code == 422
 
     def test_unknown_channel_is_400(self) -> None:
         client = TestClient(_make_app())
-        resp = client.post("/threads/t1/stream/events", json={"run_id": "run-1", "channels": ["bogus"]})
+        resp = client.post("/threads/t1/stream/events", json={"channels": ["bogus"]})
         assert resp.status_code == 400
 
-    def test_missing_run_id_is_422(self) -> None:
-        client = TestClient(_make_app())
-        resp = client.post("/threads/t1/stream/events", json={"channels": ["messages"]})
-        assert resp.status_code == 422
-
     def test_cross_tenant_thread_is_404(self) -> None:
-        client = TestClient(_make_app(owned=False))
-        resp = client.post("/threads/t1/stream/events", json={"run_id": "r", "channels": ["messages"]})
-        assert resp.status_code == 404
-
-    def test_run_not_on_thread_is_404(self) -> None:
-        """Thread owned but the supplied run_id isn't — must 404, not stream."""
-
-        class _ThreadOwnedRunNot:
-            async def scalar(self, stmt: Any) -> Any:
-                # First call (thread check) returns owned; second (run check) returns None.
-                self._calls = getattr(self, "_calls", 0) + 1
-                return "t1" if self._calls == 1 else None
-
-        app = _make_app()
-        app.dependency_overrides[get_session] = _ThreadOwnedRunNot
-        resp = TestClient(app).post(
-            "/threads/t1/stream/events", json={"run_id": "foreign-run", "channels": ["messages"]}
-        )
+        client = TestClient(_make_app(owner="other-user"))
+        resp = client.post("/threads/t1/stream/events", json={"channels": ["messages"]})
         assert resp.status_code == 404
 
     def test_stream_emits_v2_frames(self) -> None:
-        """A seeded broker run streams content-block frames over SSE."""
+        """A run on the thread streams content-block frames over SSE."""
         run_id = f"run-{uuid.uuid4().hex[:8]}"
 
         async def seed() -> None:
@@ -138,11 +140,9 @@ class TestStreamRoute:
             await broker.put(f"{run_id}_event_2", ("end", {"status": "success"}))
 
         asyncio.run(seed())
-        client = TestClient(_make_app())
+        client = TestClient(_make_app(run_ids=[run_id]))
 
-        with client.stream(
-            "POST", "/threads/t1/stream/events", json={"run_id": run_id, "channels": ["messages", "lifecycle"]}
-        ) as resp:
+        with client.stream("POST", "/threads/t1/stream/events", json={"channels": ["messages", "lifecycle"]}) as resp:
             assert resp.status_code == 200
             body = "".join(resp.iter_text())
 

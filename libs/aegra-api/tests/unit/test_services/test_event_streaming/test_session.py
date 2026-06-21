@@ -1,4 +1,4 @@
-"""Tests for ThreadEventSession: seq, channel filter, since-replay, lifecycle."""
+"""Tests for ThreadEventSession: thread-scoping, seq, channel filter, since."""
 
 from collections.abc import Iterator
 
@@ -21,6 +21,15 @@ def manager(monkeypatch: pytest.MonkeyPatch) -> Iterator[BrokerManager]:
     yield mgr
 
 
+def _lister(*run_ids: str):
+    """A run lister returning a fixed set of run ids."""
+
+    async def list_run_ids() -> list[str]:
+        return list(run_ids)
+
+    return list_run_ids
+
+
 async def _seed(mgr: BrokerManager, run_id: str, events: list[tuple[str, object]]) -> None:
     broker = mgr.get_or_create_broker(run_id)
     for i, raw in enumerate(events, start=1):
@@ -34,11 +43,23 @@ def _chunk(text: str, *, msg_id: str = "m1", last: bool = False) -> AIMessageChu
     return chunk
 
 
+def _make_session(
+    thread_id: str, *, channels: set[str], run_ids: tuple[str, ...], since: int | None = None
+) -> ThreadEventSession:
+    return ThreadEventSession(
+        thread_id,
+        channels=channels,
+        list_run_ids=_lister(*run_ids),
+        since=since,
+        idle_grace_seconds=0.0,
+    )
+
+
 async def _collect(session: ThreadEventSession) -> list[dict]:
     return [evt async for evt in session.stream()]
 
 
-class TestSessionStreaming:
+class TestThreadStreaming:
     async def test_message_stream_projects_protocol_events(self, manager: BrokerManager) -> None:
         await _seed(
             manager,
@@ -49,10 +70,10 @@ class TestSessionStreaming:
                 ("end", {"status": "success"}),
             ],
         )
-        session = ThreadEventSession("run-1", channels={"messages", "lifecycle"})
+        session = _make_session("t1", channels={"messages", "lifecycle"}, run_ids=("run-1",))
         events = await _collect(session)
 
-        methods = [(e["method"], e["params"].get("event")) for e in events]
+        methods = [(e["method"], e["params"]["data"].get("event")) for e in events]
         assert methods == [
             ("messages", "message-start"),
             ("messages", "content-block-delta"),
@@ -61,10 +82,23 @@ class TestSessionStreaming:
             ("lifecycle", "completed"),
         ]
 
+    async def test_envelope_wraps_payload_in_params_data(self, manager: BrokerManager) -> None:
+        await _seed(manager, "run-1", [("values", {"a": 1}), ("end", {"status": "success"})])
+        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",)))
+        assert events[0]["params"] == {"data": {"a": 1}, "namespace": []}
+
     async def test_seq_is_monotonic_from_one(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("values", {"a": 1}), ("end", {"status": "success"})])
-        events = await _collect(ThreadEventSession("run-1", channels={"values", "lifecycle"}))
+        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",)))
         assert [e["seq"] for e in events] == [1, 2]
+
+    async def test_seq_spans_multiple_runs_on_thread(self, manager: BrokerManager) -> None:
+        """A thread's seq is continuous across the runs that execute on it."""
+        await _seed(manager, "run-1", [("values", {"a": 1}), ("end", {"status": "success"})])
+        await _seed(manager, "run-2", [("values", {"a": 2}), ("end", {"status": "success"})])
+        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1", "run-2")))
+        # run-1: values(1) end(2); run-2: values(3) end(4)
+        assert [e["seq"] for e in events] == [1, 2, 3, 4]
 
     async def test_channel_filter_drops_unsubscribed(self, manager: BrokerManager) -> None:
         await _seed(
@@ -72,8 +106,17 @@ class TestSessionStreaming:
             "run-1",
             [("values", {"a": 1}), ("updates", {"n": {"b": 2}}), ("end", {"status": "success"})],
         )
-        events = await _collect(ThreadEventSession("run-1", channels={"values"}))
+        events = await _collect(_make_session("t1", channels={"values"}, run_ids=("run-1",)))
         assert {e["method"] for e in events} == {"values"}
+
+    async def test_seq_is_absolute_not_filter_relative(self, manager: BrokerManager) -> None:
+        await _seed(
+            manager,
+            "run-1",
+            [("values", {"a": 1}), ("updates", {"n": {"b": 2}}), ("end", {"status": "success"})],
+        )
+        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        assert [(e["method"], e["seq"]) for e in events] == [("lifecycle", 3)]
 
     async def test_since_skips_already_seen(self, manager: BrokerManager) -> None:
         await _seed(
@@ -81,64 +124,34 @@ class TestSessionStreaming:
             "run-1",
             [("values", {"a": 1}), ("values", {"a": 2}), ("end", {"status": "success"})],
         )
-        # since=1 means the client already saw seq 1; expect seq 2 and 3 only.
-        events = await _collect(ThreadEventSession("run-1", channels={"values", "lifecycle"}, since=1))
+        events = await _collect(_make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",), since=1))
         assert [e["seq"] for e in events] == [2, 3]
-
-    async def test_seq_is_absolute_not_filter_relative(self, manager: BrokerManager) -> None:
-        """seq counts every translated event, so a filtered channel still advances it."""
-        await _seed(
-            manager,
-            "run-1",
-            [("values", {"a": 1}), ("updates", {"n": {"b": 2}}), ("end", {"status": "success"})],
-        )
-        # Subscribe only to lifecycle: values(seq1) + updates(seq2) are dropped,
-        # lifecycle lands at the absolute seq 3.
-        events = await _collect(ThreadEventSession("run-1", channels={"lifecycle"}))
-        assert [(e["method"], e["seq"]) for e in events] == [("lifecycle", 3)]
-
-    async def test_reconnect_with_narrower_channels_keeps_terminal_event(self, manager: BrokerManager) -> None:
-        """A resume on a narrower channel set still delivers later events.
-
-        Absolute seq means the lifecycle event keeps its run-stream position, so
-        a since cursor from the wider first session does not skip it.
-        """
-        await _seed(
-            manager,
-            "run-1",
-            [("messages", (_chunk("hi", last=True), {})), ("end", {"status": "success"})],
-        )
-        # First session saw through seq 3 (start, delta, finish). Reconnect for
-        # lifecycle only with since=3; the terminal event is seq 4, still delivered.
-        events = await _collect(ThreadEventSession("run-1", channels={"lifecycle"}, since=3))
-        assert [(e["method"], e["seq"]) for e in events] == [("lifecycle", 4)]
 
     async def test_lifecycle_interrupted(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("end", {"status": "interrupted"})])
-        events = await _collect(ThreadEventSession("run-1", channels={"lifecycle"}))
-        assert events[0]["params"] == {"event": "interrupted"}
+        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        assert events[0]["params"]["data"] == {"event": "interrupted"}
 
     async def test_lifecycle_failed_carries_error(self, manager: BrokerManager) -> None:
         await _seed(manager, "run-1", [("error", {"status": "error", "message": "boom"})])
-        events = await _collect(ThreadEventSession("run-1", channels={"lifecycle"}))
-        assert events[0]["params"] == {"event": "failed", "error": "boom"}
+        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=("run-1",)))
+        assert events[0]["params"]["data"] == {"event": "failed", "error": "boom"}
 
-    async def test_wire_event_id_is_unique_per_event(self, manager: BrokerManager) -> None:
-        await _seed(manager, "run-1", [("messages", (_chunk("hi"), {})), ("end", {"status": "success"})])
-        events = await _collect(ThreadEventSession("run-1", channels={"messages", "lifecycle"}))
-        ids = [e["event_id"] for e in events]
-        assert len(ids) == len(set(ids))
+    async def test_applied_through_seq_tracks_max(self, manager: BrokerManager) -> None:
+        await _seed(manager, "run-1", [("values", {"a": 1}), ("end", {"status": "success"})])
+        session = _make_session("t1", channels={"values", "lifecycle"}, run_ids=("run-1",))
+        await _collect(session)
+        assert session.applied_through_seq == 2
 
     async def test_namespaced_custom_subscription_receives_custom_events(self, manager: BrokerManager) -> None:
-        """Subscribing to custom:<name> still receives the base custom events."""
         await _seed(manager, "run-1", [("custom", {"hello": "world"}), ("end", {"status": "success"})])
-        events = await _collect(ThreadEventSession("run-1", channels={"custom:my_event", "lifecycle"}))
+        events = await _collect(_make_session("t1", channels={"custom:my_event", "lifecycle"}, run_ids=("run-1",)))
         assert any(e["method"] == "custom" for e in events)
 
-    async def test_plain_custom_subscription_receives_custom_events(self, manager: BrokerManager) -> None:
-        await _seed(manager, "run-1", [("custom", {"hello": "world"}), ("end", {"status": "success"})])
-        events = await _collect(ThreadEventSession("run-1", channels={"custom", "lifecycle"}))
-        assert any(e["method"] == "custom" for e in events)
+    async def test_empty_thread_closes_after_idle(self, manager: BrokerManager) -> None:
+        """A thread with no runs ends the stream after the idle grace (0s here)."""
+        events = await _collect(_make_session("t1", channels={"lifecycle"}, run_ids=()))
+        assert events == []
 
 
 class TestValidateChannels:

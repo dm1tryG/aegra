@@ -63,28 +63,28 @@ class EventTranslator:
 
     _messages: dict[str, _MessageState] = field(default_factory=dict)
 
-    def translate(self, mode: str, payload: Any) -> list[tuple[str, dict[str, Any]]]:
+    def translate(self, mode: str, payload: Any) -> list[tuple[str, dict[str, Any], list[str]]]:
         """Map one raw ``(mode, payload)`` event to zero or more channel events.
 
-        Returns ``(channel, params)`` pairs. ``channel`` is the protocol
-        event method (``messages``, ``values``, ...). Unhandled modes
-        (``metadata``, ``debug``, ``end``, ``error``) return nothing — the
-        session handles lifecycle separately.
+        Returns ``(channel, data, namespace)`` triples: ``channel`` is the
+        protocol event method, ``data`` the per-channel payload (becomes
+        ``params.data``), ``namespace`` the subgraph path (``[]`` at root).
+        Unhandled modes (``metadata``, ``debug``, ``end``, ``error``) return
+        nothing — the session handles lifecycle separately.
         """
         if mode == "messages":
             return self._translate_message(payload)
         if mode == "values":
-            # The values channel carries the state dict directly as params.
-            return [("values", payload if isinstance(payload, dict) else {"value": payload})]
+            return [("values", payload if isinstance(payload, dict) else {"value": payload}, [])]
         if mode == "updates":
             return self._translate_updates(payload)
         if mode == "custom":
-            return [("custom", {"payload": payload})]
+            return [("custom", {"payload": payload}, [])]
         if mode == "tasks":
-            return [("tasks", payload if isinstance(payload, dict) else {"payload": payload})]
+            return [("tasks", payload if isinstance(payload, dict) else {"payload": payload}, [])]
         return []
 
-    def _translate_message(self, payload: Any) -> list[tuple[str, dict[str, Any]]]:
+    def _translate_message(self, payload: Any) -> list[tuple[str, dict[str, Any], list[str]]]:
         """Project an ``(AIMessageChunk, metadata)`` tuple into message events."""
         if not (isinstance(payload, (tuple, list)) and len(payload) == 2):
             return []
@@ -96,7 +96,7 @@ class EventTranslator:
         if not msg_id:
             return []
 
-        events: list[tuple[str, dict[str, Any]]] = []
+        events: list[tuple[str, dict[str, Any], list[str]]] = []
         state = self._messages.get(msg_id)
         if state is None:
             state = _MessageState(started=True)
@@ -110,6 +110,7 @@ class EventTranslator:
                         "id": msg_id,
                         "metadata": _wire_metadata(metadata),
                     },
+                    [],
                 )
             )
 
@@ -123,20 +124,21 @@ class EventTranslator:
                         "index": _TEXT_BLOCK_INDEX,
                         "delta": {"type": "text-delta", "text": text},
                     },
+                    [],
                 )
             )
 
         if _is_final_chunk(message):
-            events.append(("messages", {"event": "message-finish"}))
+            events.append(("messages", {"event": "message-finish"}, []))
             del self._messages[msg_id]
 
         return events
 
-    def _translate_updates(self, payload: Any) -> list[tuple[str, dict[str, Any]]]:
+    def _translate_updates(self, payload: Any) -> list[tuple[str, dict[str, Any], list[str]]]:
         """Map an updates chunk (``{node: values}``) to one event per node."""
         if not isinstance(payload, dict):
-            return [("updates", {"values": payload})]
-        return [("updates", {"node": node, "values": values}) for node, values in payload.items()]
+            return [("updates", {"values": payload}, [])]
+        return [("updates", {"node": node, "values": values}, []) for node, values in payload.items()]
 
 
 def _is_final_chunk(message: Any) -> bool:

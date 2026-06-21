@@ -29,40 +29,41 @@ from aegra_api.models import User
 from aegra_api.models.event_streaming import EventStreamRequest, ThreadCommand
 from aegra_api.services.event_streaming.capabilities import get_v2_capabilities
 from aegra_api.services.event_streaming.commands import handle_command
-from aegra_api.services.event_streaming.session import ThreadEventSession, validate_channels
+from aegra_api.services.event_streaming.session import RunLister, ThreadEventSession, validate_channels
 
 logger = structlog.getLogger(__name__)
 
 router = APIRouter(tags=["Event Streaming"], dependencies=auth_dependency)
 
 
-async def _verify_thread_owned(session: AsyncSession, thread_id: str, user: User) -> None:
-    """404 unless the thread exists and belongs to the caller."""
-    owned = await session.scalar(
-        select(ThreadORM.thread_id).where(
-            ThreadORM.thread_id == thread_id,
-            ThreadORM.user_id == user.identity,
-        )
-    )
-    if owned is None:
+async def _verify_thread_owned_or_new(session: AsyncSession, thread_id: str, user: User) -> None:
+    """Allow a not-yet-existing thread; block one owned by someone else.
+
+    The SDK mints the thread id client-side and expects ``run.start`` to
+    create it (run preparation does, owned by the caller). So a missing
+    thread is fine here; an existing thread owned by another user is 404.
+    """
+    existing_owner = await session.scalar(select(ThreadORM.user_id).where(ThreadORM.thread_id == thread_id))
+    if existing_owner is not None and existing_owner != user.identity:
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
 
-async def _verify_run_owned(session: AsyncSession, run_id: str, thread_id: str, user: User) -> None:
-    """404 unless the run belongs to this thread and caller.
+def _thread_run_lister(session: AsyncSession, thread_id: str, user: User) -> RunLister:
+    """Async callable returning the thread's run ids (oldest first), user-scoped.
 
-    Guards against a caller streaming another thread's (or user's) run by
-    supplying its run_id — the path thread_id alone isn't enough.
+    Called repeatedly while a stream is live so a run started after the
+    stream opened is picked up. Only the thread owner's runs are listed.
     """
-    owned = await session.scalar(
-        select(RunORM.run_id).where(
-            RunORM.run_id == run_id,
-            RunORM.thread_id == thread_id,
-            RunORM.user_id == user.identity,
+
+    async def list_run_ids() -> list[str]:
+        rows = await session.scalars(
+            select(RunORM.run_id)
+            .where(RunORM.thread_id == thread_id, RunORM.user_id == user.identity)
+            .order_by(RunORM.created_at.asc())
         )
-    )
-    if owned is None:
-        raise HTTPException(404, f"Run '{run_id}' not found")
+        return list(rows.all())
+
+    return list_run_ids
 
 
 def _require_v2_enabled() -> None:
@@ -79,21 +80,29 @@ async def stream_thread_events(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> EventSourceResponse:
-    """Open a channel-filtered SSE stream of v2 events for a run on the thread.
+    """Open a channel-filtered SSE stream of the thread's run events.
 
-    Each SSE frame is a protocol event envelope: ``event:`` is the channel,
-    ``data:`` the JSON envelope, ``id:`` the session ``seq`` a client echoes
-    back as ``since`` on resume.
+    Thread-scoped: events for any run on the thread flow through, so a
+    client can open the stream then issue ``run.start``. Each SSE frame's
+    ``data:`` is a protocol event envelope; ``id:`` is the ``seq`` a client
+    echoes back as ``since`` on resume.
     """
     _require_v2_enabled()
-    await _verify_thread_owned(session, thread_id, user)
-    await _verify_run_owned(session, body.run_id, thread_id, user)
+    # The SDK opens the stream (lifecycle watcher) before run.start, against a
+    # thread it minted client-side — so a not-yet-existing thread is allowed;
+    # a thread owned by another user is not.
+    await _verify_thread_owned_or_new(session, thread_id, user)
 
     channels, invalid = validate_channels(body.channels)
     if invalid:
         raise HTTPException(400, f"Unsupported channels: {', '.join(invalid)}")
 
-    session_stream = ThreadEventSession(body.run_id, channels=channels, since=body.since)
+    session_stream = ThreadEventSession(
+        thread_id,
+        channels=channels,
+        list_run_ids=_thread_run_lister(session, thread_id, user),
+        since=body.since,
+    )
     return make_sse_response(sse_to_bytes(_frame_events(session_stream)), headers=get_sse_headers())
 
 
@@ -106,7 +115,9 @@ async def post_thread_command(
 ) -> JSONResponse:
     """Run a single v2 command on the thread and return its response envelope."""
     _require_v2_enabled()
-    await _verify_thread_owned(session, thread_id, user)
+    # run.start may target a not-yet-created thread (the SDK mints the id and
+    # expects run preparation to create it); other ownership is enforced there.
+    await _verify_thread_owned_or_new(session, thread_id, user)
 
     response, _run_id = await handle_command(body.model_dump(), session=session, thread_id=thread_id, user=user)
     status_code = 200 if response.get("type") == "success" else 400

@@ -9,7 +9,7 @@ from aegra_api.services.event_streaming.protocol import (
 
 
 class TestBuildEvent:
-    def test_event_has_exact_wire_fields(self) -> None:
+    def test_event_nests_payload_under_params_data(self) -> None:
         evt = build_event(
             "messages", {"event": "message-start", "role": "ai", "id": "m1"}, seq=7, event_id="run_event_7"
         )
@@ -18,14 +18,19 @@ class TestBuildEvent:
             "seq": 7,
             "method": "messages",
             "event_id": "run_event_7",
-            "params": {"event": "message-start", "role": "ai", "id": "m1"},
+            "params": {"data": {"event": "message-start", "role": "ai", "id": "m1"}, "namespace": []},
         }
+
+    def test_namespace_is_carried(self) -> None:
+        evt = build_event("values", {"x": 1}, namespace=["sub", "graph"], seq=2)
+        assert evt["params"]["namespace"] == ["sub", "graph"]
 
     def test_event_id_omitted_when_none(self) -> None:
         evt = build_event("values", {"x": 1}, seq=1)
         assert "event_id" not in evt
         assert evt["seq"] == 1
         assert evt["method"] == "values"
+        assert evt["params"] == {"data": {"x": 1}, "namespace": []}
 
 
 class TestBuildSuccess:

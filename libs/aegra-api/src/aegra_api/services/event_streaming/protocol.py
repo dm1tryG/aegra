@@ -37,16 +37,19 @@ ErrorCode = Literal[
 
 def build_event(
     method: EventMethod | str,
-    params: dict[str, Any],
+    data: dict[str, Any],
     *,
+    namespace: list[str] | None = None,
     seq: int,
     event_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a server-push event envelope.
 
-    ``params`` carries the per-channel data verbatim (e.g. a message-start
-    dict for the ``messages`` channel, or a raw state dict for ``values``).
+    ``params`` wraps the per-channel payload as ``{data, namespace}`` — the
+    shape the LangGraph SDK reads (``params.data`` is the payload,
+    ``params.namespace`` the subgraph path, ``[]`` at the root).
     """
+    params: dict[str, Any] = {"data": data, "namespace": namespace or []}
     event: dict[str, Any] = {"type": "event", "seq": seq, "method": method, "params": params}
     if event_id is not None:
         event["event_id"] = event_id
