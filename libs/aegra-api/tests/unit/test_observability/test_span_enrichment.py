@@ -291,6 +291,20 @@ class TestMakeRunTraceContext:
 
         assert structlog.contextvars.get_contextvars() == {}
 
+    def test_anonymous_user_omits_structlog_user_id(self) -> None:
+        """user_identity=None omits user_id instead of binding it as None.
+
+        Mirrors the OTEL path, which skips user.id for anonymous runs, so
+        logs never carry a noisy ``user_id=None``.
+        """
+        ctx = make_run_trace_context("run-1", "thread-1", "my_graph", None)
+
+        bound = ctx.run(structlog.contextvars.get_contextvars)
+        assert "user_id" not in bound
+        assert bound["run_id"] == "run-1"
+        assert bound["thread_id"] == "thread-1"
+        assert bound["graph_id"] == "my_graph"
+
 
 class TestMergeRunMetadata:
     """Tests for merge_run_metadata()."""

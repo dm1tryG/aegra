@@ -203,11 +203,18 @@ def make_run_trace_context(
         trace_name=graph_id,
         metadata=metadata,
     )
-    ctx.run(
-        structlog.contextvars.bind_contextvars,
-        run_id=run_id,
-        thread_id=thread_id,
-        graph_id=graph_id,
-        user_id=user_identity,
-    )
+    # Bind structlog context vars inside the same isolated context so
+    # background-task logs include the run identifiers. Run via ``ctx.run``
+    # so the binding lands in the returned context, not the caller's.
+    # ``user_id`` is only bound when present, matching the OTEL path above
+    # (``set_trace_context`` guards on truthy ``user_id``) — anonymous runs
+    # omit the key rather than logging ``user_id=None``.
+    structlog_bindings: dict[str, str] = {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "graph_id": graph_id,
+    }
+    if user_identity is not None:
+        structlog_bindings["user_id"] = user_identity
+    ctx.run(structlog.contextvars.bind_contextvars, **structlog_bindings)
     return ctx
